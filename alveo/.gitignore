@@ -1,0 +1,15 @@
+# generated / build artifacts
+gen_src/
+build/
+host/build/
+_x/
+.Xil/
+.ipcache/
+*.xo
+*.xclbin
+*.ltx
+*.jou
+*.log
+vivado*.str
+packaged_kernel*/
+tmp_kernel_pack*/
