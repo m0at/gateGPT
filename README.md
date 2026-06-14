@@ -199,7 +199,18 @@ tools/        model, training, fixed-point reference, weight/microcode export
 data/         public makemore names corpus (training data)
 generated/    fixed-point weight ROMs (*.hex) + microcode program (ucode.hex)
 sim/          iSim testbenches (per-actuator + end-to-end golden)
+alveo/        Alveo U200 port: Vitis RTL kernel + NUM_GEN-wide generator farm + XRT host
 ```
+
+## Alveo U200 (PCIe accelerator)
+
+[`alveo/`](alveo/) ports the inference core to an **AMD/Xilinx Alveo U200** as a Vitis RTL
+kernel: it replicates the generator into a **farm of `NUM_GEN` independent streams** (default
+32) and DMAs 64-byte name records back to the host over PCIe via XRT — about **1M+ names/s
+(~7M tokens/s)** at 32 generators / 300 MHz, vs ~60k tok/s for the single Virtex-5 core. The
+`core/` RTL is reused unchanged. See [`alveo/README.md`](alveo/README.md) and
+[`alveo/SPEC.md`](alveo/SPEC.md); validate the RTL locally (no card needed) with
+`cd alveo && make sim`.
 
 ## Build & run
 

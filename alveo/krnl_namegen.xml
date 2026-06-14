@@ -1,0 +1,37 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Vitis kernel description for krnl_namegen. Arg offsets MUST match
+     rtl/krnl_namegen_control_s_axi.v exactly. ap_ctrl_hs control protocol.
+     Register contract (control slave decode -> kernel.xml offset):
+       0x00 AP_CTRL  0x04 GIE  0x08 IP_IER  0x0C IP_ISR  (reserved, not args)
+       out:         64-bit DDR pointer, lo@0x10 / hi@0x14   (size 0x8)
+       n_records:   32-bit scalar @0x1C
+       base_seed:   32-bit scalar @0x24
+       inv_temp:    32-bit scalar @0x2C  (Q5.11 signed, low 16 bits used)
+       sample_mode: 32-bit scalar @0x34  (bit0)
+     s_axi_control range 0x1000 matches C_S_AXI_CONTROL_ADDR_WIDTH=12 in the RTL.
+     m_axi_gmem is 512-bit, 64-bit addressing -> range 0xFFFFFFFFFFFFFFFF. -->
+<root versionMajor="1" versionMinor="6">
+  <kernel name="krnl_namegen" language="ip_c"
+          vlnv="m0at.com:gateGPT:krnl_namegen:1.0"
+          attributes="" preferredWorkGroupSizeMultiple="0" workGroupSize="1"
+          interrupt="true" hwControlProtocol="ap_ctrl_hs">
+    <ports>
+      <port name="s_axi_control" mode="slave"  range="0x1000"
+            dataWidth="32"  portType="addressable" base="0x0"/>
+      <port name="m_axi_gmem"    mode="master" range="0xFFFFFFFFFFFFFFFF"
+            dataWidth="512" portType="addressable" base="0x0"/>
+    </ports>
+    <args>
+      <arg name="out"         addressQualifier="1" id="0" port="m_axi_gmem"
+           size="0x8" offset="0x10" hostOffset="0x0" hostSize="0x8" type="ulong*"/>
+      <arg name="n_records"   addressQualifier="0" id="1" port="s_axi_control"
+           size="0x4" offset="0x1C" hostOffset="0x0" hostSize="0x4" type="uint"/>
+      <arg name="base_seed"   addressQualifier="0" id="2" port="s_axi_control"
+           size="0x4" offset="0x24" hostOffset="0x0" hostSize="0x4" type="uint"/>
+      <arg name="inv_temp"    addressQualifier="0" id="3" port="s_axi_control"
+           size="0x4" offset="0x2C" hostOffset="0x0" hostSize="0x4" type="uint"/>
+      <arg name="sample_mode" addressQualifier="0" id="4" port="s_axi_control"
+           size="0x4" offset="0x34" hostOffset="0x0" hostSize="0x4" type="uint"/>
+    </args>
+  </kernel>
+</root>
