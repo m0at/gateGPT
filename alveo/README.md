@@ -67,6 +67,13 @@ Knobs (env vars): `PLATFORM`, `PART` (default `xcu200-fsgd2104-2-e`), `TARGET`
 
 > Start bring-up with `NUM_GEN=2` (fast build) to confirm the end-to-end path, then scale up.
 
+> **First build? Follow the ordered checklist in [SPEC.md](SPEC.md) → "First-build checklist".**
+> It walks platform sanity → local sims → `.xo` → `sw_emu`/`hw_emu` → a conservative `hw` build
+> at `NUM_GEN=2`/`FREQ=200` → on-card greedy bring-up → scale-up, with an explicit check at each
+> step. The companion **risk register** in SPEC.md lists what is *not* verified without hardware.
+> Note: **do not set `AP_CTRL` bit7 (auto-restart)** — it currently deadlocks the kernel; use
+> chunked re-launches (the shipped host path) instead.
+
 ## 2. Build the host
 
 ```bash
@@ -107,9 +114,9 @@ python3 host/run_namegen.py build/krnl_namegen.xclbin --greedy        # -> all '
 | 1  | `gen_id` (u8)    | which generator |
 | 2  | `magic` (u16)    | `0x4E47`, record-valid sentinel |
 | 4  | `seed` (u32)     | seed used — content is reproducible from it |
-| 8  | `name[16]` (u8)  | values 0..25 = `a`..`z` |
+| 8  | `name[16]` (u8)  | values 0..25 = `a`..`z` for index `< name_len`; bytes past `name_len` are unspecified residue — read only `name[0..name_len-1]` |
 | 24 | `seq` (u64)      | global write index |
-| 32 | pad |
+| 32 | pad | not zeroed by the writer; unspecified — ignore |
 
 ## Tuning
 

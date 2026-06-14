@@ -139,7 +139,9 @@ module krnl_namegen_control_s_axi #(
             else if (int_ap_ready) int_ap_start <= int_auto_restart;
         end
     end
-    always @(posedge ACLK) if (ARESET) int_ap_idle <= 1'b0; else if (ACLK_EN) int_ap_idle <= ap_idle;
+    // Reset value 1: the kernel IS idle out of reset. Canonical Vitis resets ap_idle high
+    // so a host reading AP_CTRL immediately after reset never sees a spurious "busy" CU.
+    always @(posedge ACLK) if (ARESET) int_ap_idle <= 1'b1; else if (ACLK_EN) int_ap_idle <= ap_idle;
     always @(posedge ACLK) if (ARESET) int_ap_ready <= 1'b0; else if (ACLK_EN) int_ap_ready <= ap_ready;
     always @(posedge ACLK) begin
         if (ARESET) int_ap_done <= 1'b0;

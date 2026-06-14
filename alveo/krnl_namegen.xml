@@ -1,6 +1,15 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!-- Vitis kernel description for krnl_namegen. Arg offsets MUST match
-     rtl/krnl_namegen_control_s_axi.v. ap_ctrl_hs control protocol. -->
+     rtl/krnl_namegen_control_s_axi.v exactly. ap_ctrl_hs control protocol.
+     Register contract (control slave decode -> kernel.xml offset):
+       0x00 AP_CTRL  0x04 GIE  0x08 IP_IER  0x0C IP_ISR  (reserved, not args)
+       out:         64-bit DDR pointer, lo@0x10 / hi@0x14   (size 0x8)
+       n_records:   32-bit scalar @0x1C
+       base_seed:   32-bit scalar @0x24
+       inv_temp:    32-bit scalar @0x2C  (Q5.11 signed, low 16 bits used)
+       sample_mode: 32-bit scalar @0x34  (bit0)
+     s_axi_control range 0x1000 matches C_S_AXI_CONTROL_ADDR_WIDTH=12 in the RTL.
+     m_axi_gmem is 512-bit, 64-bit addressing -> range 0xFFFFFFFFFFFFFFFF. -->
 <root versionMajor="1" versionMinor="6">
   <kernel name="krnl_namegen" language="ip_c"
           vlnv="m0at.com:gateGPT:krnl_namegen:1.0"

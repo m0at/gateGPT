@@ -104,43 +104,78 @@ module krnl_namegen #(
         .inv_temp(arg_itemp), .sample_mode(arg_smode));
 
     // ---------------- top control FSM ----------------
-    localparam [1:0] S_IDLE = 2'd0, S_PREP = 2'd1, S_RUN = 2'd2, S_FIN = 2'd3;
-    reg  [1:0]  state;
+    // ap_ctrl_hs: a launch begins when ap_start is sampled high while idle; the run
+    // ends with a 1-cycle ap_done/ap_ready pulse. The control slave clears its ap_start
+    // register on ap_ready UNLESS auto-restart is set, in which case ap_start stays high
+    // and the kernel must immediately re-launch (canonical Vitis behavior). We cannot see
+    // int_auto_restart directly (it is internal to the control slave and not on its port
+    // list), so we infer the decision from ap_start: after the ready pulse the slave has a
+    // fixed, bounded window to update its start register; once it has settled, ap_start
+    // still being high means "auto-restart -> re-launch", low means "single launch -> idle".
+    localparam [2:0] S_IDLE = 3'd0, S_PREP = 3'd1, S_RUN = 3'd2, S_FIN = 3'd3, S_SETTLE = 3'd4;
+    reg  [2:0]  state;
     reg         srst, wstart, run_en, done_p;
+    reg  [1:0]  fin_wait;          // settle counter for the ap_start clear window
     reg  [63:0] r_out;
     reg  [31:0] r_nrec, r_seed, r_itemp, r_smode;
     wire        writer_done, writer_busy;
 
+    // idle is only asserted between runs; during the post-done settle window the CU is
+    // still "running" from XRT's perspective (ap_start has not yet been retired), so we
+    // must NOT report idle there or a host could observe done+idle simultaneously.
     assign ap_idle  = (state == S_IDLE);
     assign ap_done  = done_p;
     assign ap_ready = done_p;
 
+    // A launch is requested when ap_start is high in IDLE (fresh host launch) or still
+    // high in FIN after the settle window (auto-restart held it). Plain combinational
+    // decode -> unambiguously synthesizable (no task in the always block).
+    wire launch_req = ((state == S_IDLE) || (state == S_FIN)) && ap_start;
+
     always @(posedge ap_clk) begin
         if (areset) begin
             state <= S_IDLE; srst <= 0; wstart <= 0; run_en <= 0; done_p <= 0;
+            fin_wait <= 0;
             r_out <= 0; r_nrec <= 0; r_seed <= 0; r_itemp <= 0; r_smode <= 0;
         end else begin
             srst <= 0; wstart <= 0; done_p <= 0;
             case (state)
-                S_IDLE: if (ap_start) begin
-                    r_out   <= arg_out;   r_nrec  <= arg_nrec;  r_seed <= arg_seed;
-                    r_itemp <= arg_itemp; r_smode <= arg_smode;
-                    srst    <= 1'b1;      // flush farm + FIFO, re-seed
-                    run_en  <= 1'b1;
-                    state   <= S_PREP;
+                S_IDLE: begin
+                    if (launch_req) begin
+                        r_out   <= arg_out;   r_nrec  <= arg_nrec;  r_seed <= arg_seed;
+                        r_itemp <= arg_itemp; r_smode <= arg_smode;
+                        srst    <= 1'b1;      // flush farm + FIFO, re-seed
+                        run_en  <= 1'b1;
+                        state   <= S_PREP;
+                    end
                 end
                 S_PREP: begin
                     wstart <= 1'b1;       // start writer one cycle after srst
                     state  <= S_RUN;
                 end
                 S_RUN: if (writer_done) begin
-                    done_p <= 1'b1;       // -> ap_done/ap_ready pulse
-                    run_en <= 1'b0;
-                    state  <= S_FIN;
+                    done_p   <= 1'b1;     // -> ap_done/ap_ready pulse
+                    run_en   <= 1'b0;
+                    fin_wait <= 2'd3;     // let the control slave register ap_ready + update ap_start
+                    state    <= S_SETTLE;
                 end
-                // hold until the control slave clears ap_start (via ap_ready); prevents
-                // a single host launch from re-triggering while ap_start is still high.
-                S_FIN: if (!ap_start) state <= S_IDLE;
+                // Wait a fixed, bounded window for the control slave to retire (or hold,
+                // under auto-restart) its ap_start register, then decide.
+                S_SETTLE: if (fin_wait != 0) fin_wait <= fin_wait - 2'd1;
+                          else               state    <= S_FIN;
+                // ap_start low  => normal single launch complete -> idle.
+                // ap_start high => auto-restart latched it -> re-launch immediately.
+                S_FIN: begin
+                    if (launch_req) begin
+                        r_out   <= arg_out;   r_nrec  <= arg_nrec;  r_seed <= arg_seed;
+                        r_itemp <= arg_itemp; r_smode <= arg_smode;
+                        srst    <= 1'b1;
+                        run_en  <= 1'b1;
+                        state   <= S_PREP;
+                    end else begin
+                        state <= S_IDLE;
+                    end
+                end
                 default: state <= S_IDLE;
             endcase
         end
