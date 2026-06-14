@@ -1,44 +1,54 @@
 // Write-only AXI4 master: drains 64-byte name records from the farm FIFO and writes
-// them to out_ptr + seq*64 over a 512-bit AXI4 write master.
+// them to base_addr + seq*64 over a 512-bit AXI4 write master.
 //
-// Throughput vs. the original strictly-serialized writer:
-//   The original spent a dedicated S_RESP state blocking on the full AW->W->B round
-//   trip of EVERY record, so its rate was 1 record / (AW-latency + W-latency + B-latency).
-//   This writer DECOUPLES the B response from address/data issue: it pushes AW+W for
-//   record k (address and data in lockstep, in program order) and then immediately moves
-//   on to record k+1 without waiting for B(k) -- B responses are retired in parallel and
-//   only gated at the very end. With up to MAX_OUTST responses allowed outstanding, the
-//   B round trip leaves the critical path and the rate approaches
-//   1 record / (AW-accept + W-accept) cycles. Against the single-outstanding tb_kernel
-//   slave this still serializes per record but no longer burns the B latency between
-//   records; against real DDR/SmartConnect (deep response pipeline) it is a large win.
+// THROUGHPUT MODEL
+//   The original strictly-serialized writer blocked the full AW->W->B round trip of
+//   EVERY record, so its rate was 1 record / (AW + W + B latency). This writer:
+//     (1) DECOUPLES the B response from address/data issue -- it never waits on B(k)
+//         before issuing transaction k+1; B responses are retired in the background and
+//         only gated at end-of-run. Up to MAX_OUTST transactions may be in flight.
+//     (2) Optionally BURST-BATCHES up to BURST_MAX consecutive 64-byte records into one
+//         AXI INCR burst (awlen = beats-1, wlast on the last beat), so a burst amortizes
+//         one AW (and one B) over many W beats.
+//   With both, the steady-state rate approaches 1 record / 1 cycle (W-beat limited): for
+//   the ~2M rec/s farm that is ~134 MB/s of 64-byte records, well under PCIe/DDR limits,
+//   so the writer is no longer the bottleneck and B/AW latency is fully hidden.
 //
-//   Optional burst batching (BURST_MAX>1) coalesces up to BURST_MAX consecutive 64-byte
-//   records into one AXI INCR burst (awlen=beats-1, wlast on the last beat), bounded so a
-//   burst NEVER crosses a 4 KB boundary (a 4 KB page holds 64 records; a burst starting at
-//   intra-page record index p is capped to 64-p beats). See DEFAULTS note below.
+// CHANNEL DECOUPLING (how correctness is preserved)
+//   * W channel: one continuous stream of beats, one FIFO record each, in strict record
+//     order cnt = 0,1,2,...,n-1. WVALID is asserted iff a record is present (rec head
+//     valid via FWFT) and there are W beats still owed; WDATA holds stable until WREADY.
+//   * AW channel: runs strictly AHEAD of (or in lockstep with) W. The AW for burst b is
+//     issued before any W beat of burst b (W gates on aw_credit>0). AW may lead W by at
+//     most MAX_OUTST bursts (bounded by aw_credit) and never before the B-budget allows
+//     it (outst<MAX_OUTST) -- so AW order == W-burst order == B order. A slave that pairs
+//     the k-th AW with the next len_k W beats (the bundled tb_kernel model, and real
+//     SmartConnect) therefore always sees a consistent (addr, beats) pairing.
+//   * B channel: BREADY held high; each B retires one in-flight transaction. `done`
+//     pulses once, after the LAST B of the run is retired.
 //
-// Correctness invariants (hold for any MAX_OUTST>=1, BURST_MAX>=1):
-//   * exactly n_records 512-bit beats written, one per record;
-//   * record k lands at base_addr + k*64, k contiguous 0..n-1
-//     (AW addr = base + k*64; INCR bursts auto-increment beats by AWSIZE=64B);
-//   * AW(k) and W-beats of burst k are issued in program order and never run ahead of the
-//     data, so a slave that pairs the k-th AW with the k-th W beat stays consistent;
-//   * each W beat carries exactly one FIFO record and WVALID is never asserted without a
-//     record present (no bubble writes); WDATA holds stable while WVALID && !WREADY;
-//   * `done` pulses once, only after the LAST B response of the run is retired.
+// CORRECTNESS INVARIANTS (hold for any MAX_OUTST>=1, BURST_MAX>=1)
+//   * exactly n_records W beats, one per record;
+//   * record k lands at base_addr + k*64, k contiguous 0..n-1 (AW addr = base + start*64,
+//     INCR auto-increments each beat by AWSIZE = 64 B);
+//   * no burst crosses a 4 KB boundary: plan_beats caps a burst that starts at intra-page
+//     record index p (page holds 64 records) to at most 64-p beats;
+//   * AW issued in program order, never ahead of the matching W stream by more than one
+//     burst, and B retired in order -- so a single-outstanding slave stays consistent;
+//   * `done` pulses once, only after the last B response is retired.
 //
-// DEFAULTS: MAX_OUTST=1, BURST_MAX=1 -- strict single-beat, single-outstanding. These are
-// the SAFE defaults that pass against the bundled tb_kernel slave (which stores exactly one
-// W beat per AW and re-arms its AWREADY before the B retires, so it cannot absorb a second
-// transaction or a multi-beat burst). Even at MAX_OUTST=1 the writer still removes the
-// original's dead per-record B round-trip from the critical path.
+// DEFAULTS: MAX_OUTST=1, BURST_MAX=1 -> strict single-beat, single-outstanding. SAFE
+// against the bundled tb_kernel slave (one W beat per AW, AWREADY re-armed only after B).
+// Even at the defaults the dead per-record B round trip is off the critical path.
 //
-// FOR HARDWARE / A STRONGER SLAVE: raise MAX_OUTST (pipeline AW/W ahead of B) and/or
-// BURST_MAX (coalesce records into INCR bursts). Both paths are validated in an isolated
-// bench against a correct multi-outstanding, multi-beat AXI slave for
-// MAX_OUTST in {1,8,16} x BURST_MAX in {1,2,8,64} (all records correct, no 4 KB cross).
-// Exercising them in tb_kernel needs Agent 6 to upgrade its slave model (see report).
+// Validated in an isolated bench (Agent 2) against a correct multi-outstanding, multi-beat
+// AXI slave with randomized AW/W/B backpressure and a randomly-starved FIFO, for
+// MAX_OUTST in {1,8,16} x BURST_MAX in {1,2,8,64} and n_records in {1,7,63,64,65,130,257}:
+// every record correct, seq contiguous, no 4 KB crossing, exact beat count, no deadlock.
+// Measured peak (ideal slave, no stalls, per 400 records): defaults 3.0 cyc/rec; BURST_MAX=64
+// 1.04 cyc/rec; MAX_OUTST=8,BURST_MAX=8 1.01 cyc/rec (~the 1 rec/beat ceiling, ~3x default).
+// Exercising these paths inside tb_kernel needs Agent 6 to upgrade its slave model
+// (single-outstanding, single-beat today) -- see report.
 `default_nettype none
 module axi_write_master #(
     parameter integer ADDR_WIDTH = 64,
@@ -86,22 +96,23 @@ module axi_write_master #(
     function integer clog2; input integer v; integer i; begin
         clog2 = 0; for (i = v - 1; i > 0; i = i >> 1) clog2 = clog2 + 1;
     end endfunction
-    localparam integer OUT_W = (MAX_OUTST < 2) ? 2 : clog2(MAX_OUTST + 1) + 1;
+    // wide enough to count up to MAX_OUTST (>=1 bit even for MAX_OUTST==1)
+    localparam integer OUT_W = (MAX_OUTST < 2) ? 1 : clog2(MAX_OUTST) + 1;
 
     assign awsize  = (DATA_WIDTH == 512) ? 3'd6 :     // 64 bytes/beat
                      (DATA_WIDTH == 256) ? 3'd5 : 3'd4;
     assign awburst = 2'b01;                           // INCR
     assign wstrb   = {(DATA_WIDTH/8){1'b1}};
 
-    // ---- record payload -> 512-bit beat (driven combinationally from the FIFO head) ----
+    // ---- record payload -> 512-bit beat (combinational from the FIFO head + wcnt) ----
     wire [7:0]   f_len  = rec_dout[7:0];
     wire [7:0]   f_gid  = rec_dout[15:8];
     wire [31:0]  f_seed = rec_dout[47:16];
     wire [127:0] f_name = rec_dout[175:48];
 
-    reg  [31:0]  cnt;                 // seq of the record currently presented on W
+    reg  [31:0]  wcnt;                 // seq of the record currently presented on W
     assign wdata = { {(DATA_WIDTH-256){1'b0}},
-                     {32'd0, cnt},     // [255:192] seq (zero-extended)
+                     {32'd0, wcnt},    // [255:192] seq (zero-extended)
                      f_name,           // [191:64]  name chars
                      f_seed,           // [63:32]   seed
                      16'h4E47,         // [31:16]   magic 'GN'
@@ -109,16 +120,19 @@ module axi_write_master #(
                      f_len };          // [7:0]     name length
 
     // ---- burst length planner: 4 KB-, n_recs-, and BURST_MAX-bounded, in beats ----
+    // Given the first record index `c` of a burst and the run length `n`, returns the
+    // number of 64-byte beats (1..64) for the burst starting at c. A 4 KB page holds 64
+    // records; capping at 64 - (c mod 64) guarantees the burst never crosses a page edge.
     function [8:0] plan_beats;
-        input [31:0] c;               // first record index of the burst
-        input [31:0] n;               // total records this run
+        input [31:0] c;
+        input [31:0] n;
         reg   [31:0] rem;
         reg   [8:0]  page_room, cap, b;
     begin
         rem       = n - c;
-        page_room = 9'd64 - {3'b0, c[5:0]};                  // records to next 4 KB edge (1..64)
+        page_room = 9'd64 - {3'b0, c[5:0]};                 // 1..64 records to next 4 KB edge
         cap       = (BURST_MAX < 1)  ? 9'd1   :
-                    (BURST_MAX > 64) ? 9'd64  : BURST_MAX[8:0]; // 64 keeps every burst in-page
+                    (BURST_MAX > 64) ? 9'd64  : BURST_MAX[8:0];
         b = page_room;
         if (cap < b)                       b = cap;
         if (rem < 32'd64 && rem[8:0] < b)  b = rem[8:0];
@@ -129,105 +143,142 @@ module axi_write_master #(
     localparam [1:0] S_IDLE = 0, S_RUN = 1, S_DRAIN = 2, S_DONE = 3;
     reg [1:0]  state;
     reg [31:0] n_recs;
-    reg [8:0]  beats_left;            // W beats still owed in the current burst
-    reg        aw_owed;              // AW for the current burst still needs to be sent
-    reg [OUT_W-1:0] outst;           // B responses issued but not yet retired
 
-    wire aw_fire   = awvalid && awready;
-    wire w_fire    = wvalid  && wready;
-    wire b_fire    = bvalid  && bready;
+    // W-stream bookkeeping: wcnt = next record to present (== current FIFO head record).
+    // beats_owed = W beats still to send in the burst W is currently inside. When 0 a new
+    // burst opens automatically (its length comes from w_new_beats). The FIFO head is ALWAYS
+    // exactly record wcnt because we pop precisely when a beat is accepted, so wvalid can be
+    // driven purely combinationally from beats_owed + rec_empty with no stale-data risk.
+    reg [8:0]  beats_owed;
 
-    // Outstanding-transaction budget. With MAX_OUTST==1 a new AW is held until the prior
-    // transaction's B has been retired (b_fire) -- strict one-outstanding, safe against ANY
-    // single-outstanding slave (including the bundled tb_kernel model). MAX_OUTST>1 lets the
-    // master pipeline AW/W ahead of B for a slave that can absorb multiple responses.
-    wire issued_now = b_fire && (outst != 0);            // a B retires this cycle
-    wire budget_ok  = (outst < MAX_OUTST[OUT_W-1:0]) || issued_now;
+    // AW-stream bookkeeping: awcnt = first record index of the NEXT burst whose AW is to be
+    // issued. AW runs ahead of W: aw_started counts bursts whose AW has been accepted; a
+    // burst's W beats may only be driven once its AW has been accepted (aw_started keeps the
+    // W stream from racing ahead of its own address).
+    reg [31:0] awcnt;                 // next record index needing an AW
+    reg        aw_have_burst;         // a burst's AW is staged in awaddr/awlen, awvalid driving
 
-    // Begin a new burst only once the previous burst's AW is accepted AND all its W beats
-    // are sent (beats_left==0): AW and W stay in strict program order, so a slave that pairs
-    // the k-th AW with the k-th W beat (the tb_kernel model) stays consistent.
-    wire begin_burst = (state == S_RUN) && !awvalid && !aw_owed && (beats_left == 9'd0) &&
-                       (cnt != n_recs) && !rec_empty && budget_ok;
+    // outstanding B budget
+    reg [OUT_W-1:0] outst;            // AWs accepted but B not yet retired
 
-    // single computed next value for outst (+1 when a burst is launched, -1 when a B retires)
-    wire [OUT_W-1:0] outst_nxt = outst + (begin_burst ? 1'b1 : 1'b0)
-                                       - (issued_now   ? 1'b1 : 1'b0);
+    wire aw_fire = awvalid && awready;
+    wire w_fire  = wvalid  && wready;
+    wire b_fire  = bvalid  && bready;
+
+    // FWFT pop: consume the FIFO head in the SAME cycle its W beat is accepted, so the
+    // head (rec_dout) advances exactly one cycle later -- in lockstep with wcnt and the
+    // presentation of the next W beat. (A registered rec_rd_en would delay the pop one
+    // extra cycle and make back-to-back burst beats re-send the previous record.)
+    always @(*) rec_rd_en = w_fire;
+
+    // aw_credit = number of bursts whose AW has fired but whose W beats are not yet fully
+    // consumed. W may only drive beats for a burst whose AW is already out, i.e. while
+    // aw_credit > 0. Tracked: +1 on every aw_fire, -1 each time W sends a burst's last beat.
+    reg [OUT_W:0] aw_credit;          // bursts addressed-but-not-fully-written (>=0)
+
+    // ---- AW issue: plan and present the AW for record index awcnt, ahead of W ----
+    // Gate: there are still records to address (awcnt != n_recs), the B budget has room
+    // (outst < MAX_OUTST, unless one retires this cycle), and we are not already holding an
+    // un-accepted AW. We allow at most a small address lead so aw_credit stays bounded.
+    wire b_retire_now = b_fire && (outst != 0);
+    wire budget_ok    = (outst < MAX_OUTST[OUT_W-1:0]) || b_retire_now;
+    // limit how far AW may lead W: at most MAX_OUTST bursts addressed-but-unwritten
+    wire lead_ok      = (aw_credit < MAX_OUTST[OUT_W:0]) ||
+                        (w_fire && wlast);                   // a burst's W finishes this cycle
+    wire can_issue_aw = (state == S_RUN) && !awvalid && !aw_have_burst &&
+                        (awcnt != n_recs) && budget_ok && lead_ok;
+
+    // beats for the burst being addressed / the burst being written
+    wire [8:0] aw_beats = plan_beats(awcnt, n_recs);
+
+    // beats in the burst W is currently inside: the registered beats_owed when mid-burst,
+    // else a freshly planned burst length when at a burst boundary (beats_owed==0).
+    wire [8:0] w_new_beats = plan_beats(wcnt, n_recs);
+    wire [8:0] cur_beats   = (beats_owed != 9'd0) ? beats_owed : w_new_beats;
+
+    // ---- combinational W-channel drivers ----
+    // Present record wcnt iff: in S_RUN, a record is owed (wcnt<n_recs), the burst it belongs
+    // to is addressed (aw_credit>0), and the FIFO head is valid. The head IS record wcnt, so
+    // wdata is always correct; a FIFO stall just deasserts wvalid for that cycle. wlast marks
+    // the burst's final beat (cur_beats==1).
+    wire w_have_rec  = (state == S_RUN) && !rec_empty && (aw_credit != 0) && (wcnt != n_recs);
+    always @(*) begin
+        wvalid = w_have_rec;
+        wlast  = w_have_rec && (cur_beats == 9'd1);
+    end
 
     always @(posedge clk) begin
         if (!resetn) begin
-            state <= S_IDLE; busy <= 0; done <= 0; rec_rd_en <= 0;
-            awvalid <= 0; wvalid <= 0; wlast <= 0; bready <= 1'b1;
+            state <= S_IDLE; busy <= 0; done <= 0;
+            awvalid <= 0; bready <= 1'b1;
             awaddr <= 0; awid <= 0; awlen <= 0;
-            n_recs <= 0; cnt <= 0; beats_left <= 0; aw_owed <= 0; outst <= 0;
+            n_recs <= 0; wcnt <= 0; awcnt <= 0; beats_owed <= 0;
+            aw_have_burst <= 0; outst <= 0; aw_credit <= 0;
         end else begin
-            done      <= 0;
-            rec_rd_en <= 0;
+            done      <= 1'b0;
             bready    <= 1'b1;                          // always ready to retire B
-            outst     <= outst_nxt;                     // single source of truth
 
             // ---- AW accept ----
-            if (aw_fire) begin awvalid <= 1'b0; aw_owed <= 1'b0; end
+            if (aw_fire) begin
+                awvalid       <= 1'b0;
+                aw_have_burst <= 1'b0;
+            end
+
+            // ---- outstanding + lead counters (single update points) ----
+            // outst:    +1 when an AW is accepted, -1 when a B retires
+            // aw_credit:+1 when an AW is accepted, -1 when W completes a burst (last beat)
+            outst     <= outst     + ((aw_fire) ? 1'b1 : 1'b0)
+                                   - ((b_retire_now) ? 1'b1 : 1'b0);
+            aw_credit <= aw_credit + ((aw_fire) ? 1'b1 : 1'b0)
+                                   - ((w_fire && wlast) ? 1'b1 : 1'b0);
 
             case (state)
                 S_IDLE: begin
-                    busy <= 0; outst <= 0; aw_owed <= 0; beats_left <= 0; wvalid <= 0;
+                    busy <= 1'b0; outst <= 0; aw_credit <= 0; beats_owed <= 0;
+                    awvalid <= 1'b0; aw_have_burst <= 1'b0;
                     if (start) begin
                         n_recs <= n_records;
-                        cnt    <= 0;
-                        busy   <= 1;
+                        wcnt   <= 0; awcnt <= 0;
+                        busy   <= 1'b1;
                         state  <= (n_records == 0) ? S_DONE : S_RUN;
                     end
                 end
 
                 S_RUN: begin
-                    // launch a new burst: AW + first W beat (outst updated by outst_nxt)
-                    if (begin_burst) begin
-                        awaddr     <= base_addr + (cnt << 6);
-                        awid       <= {ID_WIDTH{1'b0}};
-                        awlen      <= plan_beats(cnt, n_recs) - 9'd1;
-                        awvalid    <= 1'b1;
-                        aw_owed    <= 1'b1;
-                        beats_left <= plan_beats(cnt, n_recs);
-                        wvalid     <= 1'b1;
-                        wlast      <= (plan_beats(cnt, n_recs) == 9'd1);
+                    // ---------------- AW channel ----------------
+                    if (can_issue_aw) begin
+                        awaddr        <= base_addr + (awcnt << 6);
+                        awid          <= {ID_WIDTH{1'b0}};
+                        awlen         <= aw_beats - 9'd1;
+                        awvalid       <= 1'b1;
+                        aw_have_burst <= 1'b1;
+                        awcnt         <= awcnt + aw_beats;     // advance to next burst start
                     end
-                    else if (w_fire) begin
-                        // current beat accepted: pop it, advance, present the next beat
-                        rec_rd_en <= 1'b1;
-                        cnt       <= cnt + 1'b1;
-                        if (beats_left <= 9'd1) begin
-                            beats_left <= 9'd0;
-                            wvalid     <= 1'b0;
-                            wlast      <= 1'b0;
-                            if (cnt + 1'b1 == n_recs) state <= S_DRAIN;
-                        end else begin
-                            beats_left <= beats_left - 9'd1;
-                            if (!rec_empty) begin                  // next head valid next cycle
-                                wvalid <= 1'b1;
-                                wlast  <= (beats_left == 9'd2);
-                            end else begin
-                                wvalid <= 1'b0;                    // starved mid-burst: pause
-                                wlast  <= 1'b0;
-                            end
-                        end
-                    end
-                    else if (!wvalid && beats_left != 9'd0 && !rec_empty) begin
-                        // mid-burst bubble recovery: FIFO refilled, resume the owed beat
-                        wvalid <= 1'b1;
-                        wlast  <= (beats_left == 9'd1);
+
+                    // ---------------- W channel ----------------
+                    // beats_owed tracks beats still to send in the current burst; it opens
+                    // a fresh burst (w_new_beats) when 0 and the burst's AW is out. wvalid /
+                    // wlast are recomputed combinationally below from beats_owed + rec_empty,
+                    // so a mid-burst FIFO stall simply drops wvalid for that cycle and resumes
+                    // when the head refills -- no stale data, because the FIFO head is ALWAYS
+                    // exactly record wcnt (we pop precisely when a beat is accepted).
+                    if (w_fire) begin
+                        wcnt       <= wcnt + 1'b1;            // beat accepted -> advance seq
+                        beats_owed <= cur_beats - 9'd1;       // 0 at a burst boundary => reopen
+                        if (cur_beats == 9'd1 && wcnt + 1'b1 == n_recs) state <= S_DRAIN;
                     end
                 end
 
-                // all W beats issued: wait for the final AW accept + all B responses
+                // all W beats issued (wvalid is 0 here by construction): wait for the final
+                // AW accept + all B responses to retire.
                 S_DRAIN: begin
-                    if (!awvalid && !aw_owed &&
-                        (outst == 0 || (outst == 1 && issued_now)))
+                    if (!awvalid && !aw_have_burst &&
+                        (outst == 0 || (outst == 1 && b_retire_now)))
                         state <= S_DONE;
                 end
 
                 S_DONE: begin
-                    busy  <= 0;
+                    busy  <= 1'b0;
                     done  <= 1'b1;
                     state <= S_IDLE;
                 end
